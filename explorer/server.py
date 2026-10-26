@@ -15,22 +15,20 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import NO_MODEL, Runtime  # noqa: E402
+from model_profile import ARCH, BACKEND, CACHE, MODEL_NAME, NAMES, NO_MODEL, PROFILE, RUNS, STATS  # noqa: E402
+if BACKEND == "mlx":
+    from runtime_mlx import Runtime
+else:
+    from runtime import Runtime
 
-RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
-NAMES = os.path.join(ROOT, "explorer", "names.json")
+for directory in (CACHE, RUNS, STATS):
+    os.makedirs(directory, exist_ok=True)
 PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
-        "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
-        "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
-        "linear_v_heads": _cfg.linear_num_value_heads}
 
 app = FastAPI()
 
@@ -145,7 +143,7 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
+    return {"model": MODEL_NAME, "profile": PROFILE, "backend": BACKEND, "arch": ARCH,
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -279,7 +277,7 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
+LENS_INDEX = os.path.join(CACHE, "lens_index.npz")
 _lens = {}
 
 
@@ -296,7 +294,8 @@ async def search(q: str, limit: int = 300):
     idx = lens_index()
     q = q.strip().lower()
     if idx is None or len(q) < 2:
-        return {"ready": idx is not None, "results": []}
+        return {"ready": idx is not None, "results": [],
+                "message": "Lens index is not built. Run scripts/build_mlx_lens.py." if idx is None and BACKEND == "mlx" else None}
     vocab = await asyncio.to_thread(rt.vocab_strings)
     match = np.array([i for i, t in enumerate(vocab) if q in t.lower()], dtype=np.int32)
     if not len(match):
@@ -327,8 +326,12 @@ async def search(q: str, limit: int = 300):
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
-MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
+ACT_SCALE = os.path.join(CACHE, "act_scale.npz")
+MAX_INFER_TOKENS = 1024  # activation and score arrays both scale with layers * tokens * MLP width
+
+
+def as_numpy(value):
+    return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
 
 
 @app.get("/api/fires")
@@ -338,14 +341,14 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
     if not os.path.exists(ACT_SCALE):
         return {"ready": False, "results": []}
     sc = np.load(ACT_SCALE)
-    ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
+    ids = await asyncio.to_thread(rt.chat_ids if chat else rt.tok.encode, text)
     acts = await asyncio.to_thread(rt.all_activations, ids)
     toks = [rt.tok.decode([t]) for t in ids]
     cand = []
     for l, (mx, amx, mn, amn) in acts.items():
-        p = mx.numpy() / np.maximum(sc["pos"][l], 1e-3)
-        q = mn.numpy() / np.minimum(sc["neg"][l], -1e-3)
-        for arr, idx, sign, raw in ((p, amx.numpy(), "+", mx.numpy()), (q, amn.numpy(), "-", mn.numpy())):
+        p = as_numpy(mx) / np.maximum(sc["pos"][l], 1e-3)
+        q = as_numpy(mn) / np.minimum(sc["neg"][l], -1e-3)
+        for arr, idx, sign, raw in ((p, as_numpy(amx), "+", as_numpy(mx)), (q, as_numpy(amn), "-", as_numpy(mn))):
             top = np.argpartition(-arr, limit)[:limit]
             cand += [(float(arr[n]), l, int(n), sign, int(idx[n]), float(raw[n])) for n in top]
     cand.sort(reverse=True)
@@ -365,7 +368,7 @@ _infer = {}
 async def score_text(text, chat=False):
     """Every neuron's activation at every token of `text` ([L, T, N]) and its signed score: the positive side as a
     multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz)."""
-    ids = rt.chat_ids(text) if chat else rt.tok(text).input_ids
+    ids = rt.chat_ids(text) if chat else rt.tok.encode(text)
     ids = ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.full_activations, ids)  # [L, T, N]
     sc = np.load(ACT_SCALE)
@@ -452,6 +455,8 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     N = S.shape[1]
     active = {(int(i // N), int(i % N)) for i in cand}
     ci = rt.con_index()
+    if ci is None:
+        return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
     rows = []
     for l, n in active:
         for i in range(ci["k"]):
@@ -471,7 +476,9 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
 def layout(kind: str = "writes"):
     """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    if kind not in ("writes", "reads"):
+        return {"available": False}
+    path = os.path.join(CACHE, f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
     cell = np.load(path)["cell"].astype(np.int16)
@@ -485,6 +492,15 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
     out = []
+    if ci is None:
+        # Without a whole-model index, show only the selected neuron's measured
+        # weight links. Do not fabricate a multi-hop cone from another model.
+        direct = rt.connections(layer, n, first or k, 0)
+        for side in ("down", "up"):
+            for c in direct[side]:
+                src, dst = ((layer, n), (c["layer"], c["n"])) if side == "down" else ((c["layer"], c["n"]), (layer, n))
+                out.append((*src, *dst, c["z"] * c["sign"], 1 if side == "down" else -1))
+        return out
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
         front, seen, hop, start = [(layer, n)], {(layer, n)}, 1, len(out)
@@ -529,6 +545,10 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     `held_by` (the pole that inhibits it)."""
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
+    if lens is None:
+        return {"src": "unavailable", "links": 0,
+                "down": {"neurons": 0, "toward": [], "away": []},
+                "up": {"neurons": 0, "fed_by": [], "held_by": []}}
     v = rt.vocab_strings()
     key_src = "steer" if st is not None else "logit"
     if _idf.get("src") != key_src:
@@ -581,7 +601,7 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
 # Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
 # endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(CACHE, "agent")  # model-specific agent sessions
 _chats = {}
 _act = {}
 
@@ -589,17 +609,18 @@ _act = {}
 def act_range(layer, n):
     if "pos" not in _act and os.path.exists(ACT_SCALE):
         z = np.load(ACT_SCALE)
-        _act.update(pos=z["pos"], neg=z["neg"], tokens=int(z["tokens"]))
+        _act.update(pos=z["pos"], neg=z["neg"], tokens=int(z["tokens"]),
+                    source=str(z["source"]) if "source" in z.files else "FineWeb-Edu")
     if "pos" not in _act:
         return None
     return {"act_max": round(float(_act["pos"][layer, n]), 3), "act_min": round(float(_act["neg"][layer, n]), 3),
-            "over_tokens": _act["tokens"], "source": "FineWeb-Edu"}
+            "over_tokens": _act["tokens"], "source": _act["source"]}
 
 
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
+    return {"model": MODEL_NAME, "backend": BACKEND, "arch": ARCH, "layers_with_sweeps": sorted(runs),
             "named_neurons": len(names()), "live_model": not NO_MODEL}
 
 
@@ -645,7 +666,8 @@ def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
     return {"links": len(links), "neurons": len(best), "per_hop": dict(sorted(per_hop.items())),
             "note": "weight-only direct-path links chained; paths past hop 1 are leads, not circuits",
             "nodes": [{"neuron": f"L{l} N{m}", "hop": hop, "z": round(abs(z), 1), "sign": 1 if z > 0 else -1,
-                       "steer_up": [v[t] for t in idx["up"][l, m, :5]], "name": nm.get(f"L{l}/N{m}") or None}
+                       "steer_up": [v[t] for t in idx["up"][l, m, :5]] if idx is not None else [],
+                       "name": nm.get(f"L{l}/N{m}") or None}
                       for (l, m), (z, hop) in nodes]}
 
 
@@ -692,7 +714,7 @@ async def agent_activations(req: Request):
                "mul" if p.get("all") else p.get("mode", "add")) for p in items if "head" not in p]
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
     for l, hd, _ in hs:
-        if hd is not None and not 0 <= hd < rt.n_heads(l):
+        if rt.n_heads(l) == 0 or (hd is not None and not 0 <= hd < rt.n_heads(l)):
             return {"error": f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"}
     r = await asyncio.to_thread(rt.read, int(b["layer"]), int(b["n"]), b["text"], b.get("chat", False), pushes, hs)
     units = [[u["text"], round(u["act"], 3)] for u in r["units"]]
@@ -710,7 +732,7 @@ def _interventions(b):
                "mul" if p.get("all") else p.get("mode", "add")) for p in items if "head" not in p]
     hs = [(int(h["layer"]), None if h["head"] in ("all", None) else int(h["head"]), float(h.get("dose", 0))) for h in heads]
     for l, hd, _ in hs:
-        if hd is not None and not 0 <= hd < rt.n_heads(l):
+        if rt.n_heads(l) == 0 or (hd is not None and not 0 <= hd < rt.n_heads(l)):
             return pushes, hs, f"layer {l} has {rt.n_heads(l)} heads ({ARCH['layer_types'][l]})"
     return pushes, hs, None
 
@@ -732,23 +754,25 @@ async def agent_logprobs(req: Request):
     dec = lambda i: rt.tok.decode([int(i)])
     targets = []
     for t in b.get("targets") or []:
-        tid = rt.tok(t, add_special_tokens=False).input_ids
+        tid = rt.tok.encode(t, add_special_tokens=False)
         if tid:
             targets.append((t, tid[0], len(tid) > 1))
 
     def view(lp):
-        v, i = lp.topk(k)
-        return {"top": [[dec(t), round(float(x), 3)] for x, t in zip(v, i)],
+        lp = as_numpy(lp)
+        i = np.argsort(-lp)[:k]
+        return {"top": [[dec(t), round(float(lp[t]), 3)] for t in i],
                 "targets": [{"text": t, "token": dec(tid), "logprob": round(float(lp[tid]), 3),
                              **({"first_token_only": True} if multi else {})} for t, tid, multi in targets]}
     if alt is None:
         return view(base)
-    d = alt.exp() - base.exp()  # ranked by probability gained or lost, so the far tail's large log ratios stay out
-    up, down = d.topk(12), (-d).topk(12)
+    base, alt = as_numpy(base), as_numpy(alt)
+    d = np.exp(alt) - np.exp(base)  # ranked by probability gained or lost
+    up, down = np.argsort(-d)[:12], np.argsort(d)[:12]
     row = lambda i: [dec(i), round(float(base[i]), 2), round(float(alt[i]), 2)]
     return {"baseline": view(base), "intervened": view(alt),
-            "kl": round(float((base.exp() * (base - alt)).sum()), 4),
-            "rose": [row(i) for i in up.indices], "fell": [row(i) for i in down.indices],
+            "kl": round(float((np.exp(base) * (base - alt)).sum()), 4),
+            "rose": [row(i) for i in up], "fell": [row(i) for i in down],
             "rows_are": "[token, baseline logprob, intervened logprob]",
             "pushed": [{"neuron": f"L{l} " + ("MLP (all)" if n is None else f"N{n}"), "dose": dd, "mode": m} for l, n, dd, m in pushes],
             "heads": [{"layer": l, "head": "all" if hd is None else hd, "scale": sc} for l, hd, sc in hs]}
@@ -809,7 +833,7 @@ async def agent_fires(req: Request):
         sg = "+" if S[l, n] > 0 else "-"
         res.append({"neuron": f"L{l} N{n}", "pole": sg, "score": round(float(abs(S[l, n])), 2),
                     "act": round(float(acts[l, pos, n]), 3), "name": nm.get(f"L{l}/N{n}") or None,
-                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]]})
+                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]] if st is not None else []})
     return {"tokens": toks, "at": pos, "token": toks[pos],
             "note": "score = activation / the neuron's typical extreme on that side; 1 = as strong as its usual max",
             "neurons": res}
@@ -877,6 +901,10 @@ def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
     text = open(AGENT_PROMPT).read()
+    text = text.replace("Qwen3.5-4B (32 layers, 9216 SwiGLU MLP neurons per\nlayer, hidden size 2560)",
+                        f"{MODEL_NAME} ({ARCH['n_layers']} layers, {ARCH['inter']} SwiGLU MLP neurons per\nlayer, hidden size {ARCH['hidden']})")
+    if BACKEND == "mlx":
+        text += "\n\nThis run uses MLX/Metal and LFM hybrid convolution/attention layers. Activation ranges come from a small local reference text, not FineWeb-Edu. Sweeps and full-model indexes may be absent. Three steering rows run sequentially. Read overview and source metadata; do not transfer Qwen neuron identities or findings to LFM.\n"
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
             text = text.rstrip() + "\n\n" + open(extra).read()
@@ -1049,7 +1077,8 @@ async def agent_chat(req: Request):
 
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    return {"status": rt.status, "backend": BACKEND, "model": MODEL_NAME,
+            "error": getattr(rt, "error", None)}
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
@@ -1057,17 +1086,21 @@ app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), h
 @app.on_event("startup")
 def preload():
     def go():
-        if NO_MODEL:
-            rt.status = "no model"
-            rt.vocab_strings()
-            return
-        rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
-            os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
-            rt.build_lens_index(LENS_INDEX)
-        rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
-            rt.build_act_scale(ACT_SCALE)
+        try:
+            if NO_MODEL:
+                rt.status = "no model"
+                return
+            rt.ensure_loaded()
+            # MLX computes a selected neuron's lens on demand. A whole-model
+            # index is an explicit offline job, not an implicit startup sweep.
+            if BACKEND == "torch" and not os.path.exists(LENS_INDEX):
+                os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
+                rt.build_lens_index(LENS_INDEX)
+            if not os.path.exists(ACT_SCALE):
+                rt.build_act_scale(ACT_SCALE)
+            rt.status = "ready"
+        except Exception as exc:
+            rt.error, rt.status = str(exc), "error"
     threading.Thread(target=go, daemon=True).start()
 
 

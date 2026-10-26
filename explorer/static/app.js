@@ -18,6 +18,10 @@ const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12,
 
 const index = await api("/api/index");
 const arch = index.arch;
+document.title = `${index.model} · Neuron Explorer`;
+$("#jump").placeholder = `L${arch.n_layers - 1} N100`;
+$("#inf-hi").value = arch.n_layers - 1;
+$("#layer").title = `${index.model} · ${arch.n_layers} layers · ${arch.inter.toLocaleString()} neurons/layer`;
 const tip = $("#tip");
 
 // ---------- map ----------
@@ -33,7 +37,9 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
       const full = p.full;
-      return showTip(x, y, `L${p.layer}`, full ? `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
+      const label = arch.layer_types[p.layer] === "conv" ? `short convolution · kernel ${arch.conv_kernel}` :
+        `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`;
+      return showTip(x, y, `L${p.layer}`, full ? `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : label);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
     const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;
@@ -159,7 +165,7 @@ layerSel.onchange = () => { setLayer(+layerSel.value); map.enterLayer(+layerSel.
 async function setLayer(l) {
   state.layer = l; layerSel.value = l;
   if (scatter.data && scatter.data.layer !== l) { scatter.setData(null); hideTip(); }
-  try { localStorage.setItem("ne.layer", l); } catch {}
+  try { localStorage.setItem(`ne.${index.profile}.layer`, l); } catch {}
   if (!state.units[l]) {
     if (!lensResults) $("#rows").innerHTML = `<li class="head">…</li>`;
     const us = index.layers[l] ? await api(`/api/units?layer=${l}`) : [];
@@ -365,7 +371,7 @@ function renderList() {
 }
 // lens hits (net tab) or what fired (run tab)
 function renderResults(r, ol) {
-  if (!r.ready) { ol.innerHTML = `<li class="head">${esc(state.statusText || "indexing lens")}</li>`; return; }
+  if (!r.ready) { ol.innerHTML = `<li class="head">${esc(r.message || state.statusText || "indexing lens")}</li>`; return; }
   const rows = (r.results || []).map(x => `<li class="res${x.swept === false ? " unswept" : ""}" data-l="${x.layer}" data-n="${x.n}" data-kind="neuron">
     <span class="n">L${x.layer} N${x.n}</span><span class="sg ${x.sign === "+" ? "up" : "down"}">${r.fires ? `${x.sign === "+" ? "" : "−"}${x.score.toFixed(1)}×` : `${x.sign === "+" ? "+" : "−"}${x.rank + 1}`}</span>
     <span class="w">${r.fires ? `<span class="tk">"${esc(x.token)}"</span>` : ""}${x.name ? `<b>${esc(x.name)}</b> ` : ""}${esc(x.lens.join(" "))}</span></li>`).join("");
@@ -460,6 +466,10 @@ function openClaude() {
 }
 
 async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
+  if (!Number.isInteger(layer) || !Number.isInteger(n) || layer < 0 || layer >= arch.n_layers || n < 0 || (kind === "neuron" && n >= arch.inter)) {
+    $("#status").textContent = `Use L0–L${arch.n_layers - 1} and N0–N${arch.inter - 1}`;
+    return;
+  }
   if (!agentSelecting) clearAgentMarks();
   flushName();
   if (running) running.abort();
@@ -718,7 +728,7 @@ async function pollStatus() {
   try {
     const s = await api("/api/status");
     state.statusText = s.status;
-    $("#status").textContent = s.status === "ready" ? "" : s.status;
+    $("#status").textContent = s.status === "ready" ? `${index.model} · ${index.backend}` : s.error || s.status;
     if (s.status === "ready" && lensResults && !lensResults.ready) runLensSearch();
     setTimeout(pollStatus, s.status === "ready" ? 8000 : 2000);
   } catch {
@@ -731,7 +741,7 @@ pollStatus();
 window.__ne = { map, state, scatter };
 // ---------- start ----------
 const have = Object.keys(index.layers).map(Number);
-let saved = null; try { const v = localStorage.getItem("ne.layer"); if (v !== null) saved = +v; } catch {}
+let saved = null; try { const v = localStorage.getItem(`ne.${index.profile}.layer`); if (v !== null) saved = +v; } catch {}
 const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
 await setLayer(first);
 if (location.hash) fromHash();
@@ -757,7 +767,7 @@ function md(src) {
 }
 const EMPTY = `<div class="a-empty dim">Ask anything about the model, or open a neuron and press <b>explain</b>.</div>`;
 // the conversation persists in this browser: chat id (= claude session, resumed server side) and the rendered thread
-const AGENT_KEY = "explorer.agent";
+const AGENT_KEY = `explorer.${index.profile}.agent`;
 function saveAgent() {
   try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML })); } catch {}
 }

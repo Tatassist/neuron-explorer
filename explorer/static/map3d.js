@@ -113,7 +113,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       new THREE.LineBasicMaterial({ color: full ? PAL.slabEdgeFull : PAL.slabEdge, transparent: true }));
     edges.position.copy(slab.position); scene.add(edges);
     slab.userData.edges = edges; slab.userData.baseOpacity = slab.material.opacity;
-    const heads = full ? arch.attn_heads : arch.linear_v_heads;
+    const heads = full ? arch.attn_heads : arch.layer_types[l] === "conv" ? 0 : arch.linear_v_heads;
     for (let h = 0; h < heads; h++) {
       const z = ((h + 0.5) / heads - 0.5) * SHEET * 0.82;
       (full ? headPos.full : headPos.lin).push(ax + t / 2 + 0.003, SHEET_Y0 + 0.35, z, ax + t / 2 + 0.003, SHEET_Y0 + SHEET - 0.35, z);

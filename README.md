@@ -1,61 +1,63 @@
-# neuron explorer
+# Neuron Explorer — MLX / LFM2.5
 
-Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
-rollout is kept, and the explorer lays the results out over a 3D view of the model.
+A fork of [lyramakesmusic/neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer), adapted for **LFM2.5-350M on Apple Silicon with MLX/Metal**.
 
-![neuron explorer](explorer.png)
+The default checkpoint is the already-installed `LiquidAI/LFM2.5-350M-MLX-8bit` under `$HOME/.lmstudio/models`. It uses 8-bit affine weights, group size 64. A `bfloat16` entry in its config does not mean the weights are unquantized.
 
-## Explorer
+## Run
 
-    uv sync
-    uv run python explorer/server.py        # http://localhost:8791
+```bash
+bash scripts/run_mlx.sh
+# http://127.0.0.1:8791
+```
 
-Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
-`explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
-steered chat, lens, connections and live inference over your own text.
+The launcher reuses `$HOME/venvs/mlx/bin/python3` when available. To select another existing environment:
 
-- **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
-  steer lens and logit lens; click opens it; click a layer's label to view its sheet face-on. `writes` places
-  neurons with similar down-projection columns next to each other.
-- **list**: units ranked by word-cluster mass against random-direction controls; `lens` searches the steer and logit
-  lenses for a token, `fires` runs your text through the model and filters neurons by activation.
-- **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
-  connections, and a name.
-- **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
-- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
-  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
-  live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
-  tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
-  `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
-  `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
+```bash
+EXPLORER_PYTHON=/path/to/python bash scripts/run_mlx.sh
+```
 
-## Sweep
+Otherwise it uses `uv run` with the checked-in MLX dependencies. The launcher enables offline model loading. No weights are downloaded; no CPU or hosted inference fallback is enabled. Run GPU commands with normal macOS Metal access, outside a restricted sandbox.
 
-Runs on a CUDA 13 GPU pod with the steering fork of vLLM ([RhizoNymph/vllm](https://github.com/RhizoNymph/vllm)).
+`EXPLORER_MODEL` can select another local LFM2/LFM2.5 MLX checkpoint. Model config, tensor dimensions and weight-file identities determine an isolated profile under `data/`. Bundled Qwen caches, neuron names and experiments are never used for LFM.
 
-    bash sweep/setup_pod.sh                                   # fork, deps, model; writes /workspace/env.sh
-    python sweep/neuron_stats.py --layers 22 --tokens 2000000 --out stats/q35-4b
-    python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --design main_rel --dose-unit rel \
-        --neurons all --random-controls 256 --run q35-4b-L22
-    sweep/run_depth.sh "4 9 13 17" 384 64                     # random-subset sweep across several layers
+## Available
 
-`main_rel` doses are fractions of the median residual norm leaving the layer: {who, snake, orange} × {−0.7, +0.5, +0.8}
-and {free} × {+3}, plus one unsteered baseline per prompt.
+1. **3D map:** 16 hybrid convolution/attention layers, 4,608 SwiGLU neurons per layer, hidden width 1,024. The MLP width comes from the actual tensors; LFM adjusts the config's nominal feed-forward width. Convolution layers are labelled as convolution and have no attention heads.
+2. **Activation inspection:** paste text into `run` or `fires`, select a token, and inspect positive/negative activations. Neurons can be opened directly with a jump such as `L15 N100`.
+3. **Steered chat:** compare positive, baseline and negative interventions using the existing chat panel. Each row has its own conversation and hybrid convolution/KV cache. Rows run sequentially on MLX. Additive doses are fractions of the layer's median reference residual norm, divided by the down-column norm. Multiplicative mode retains upstream semantics: x dose / x 1 / x minus-dose (including a sign flip in the negative row).
+4. **Weight analyses:** per-neuron positive/negative logit lenses, token search after index building, and direct connections computed with LFM's RMSNorm convention. These are weight-only hypotheses, not proof of circuits.
+5. **Research API/MCP:** activation reads, multi-neuron interventions, attention-head ablation on attention layers, next-token logprobs and comparisons. The optional upstream Claude tab still requires its CLI and login; starting the explorer does not launch a Claude conversation.
 
-| script | output |
-|---|---|
-| `sweep/neuron_stats.py` | per-neuron activation extremes by sign regime, down columns, residual norms |
-| `sweep/steer_sweep.py` | `runs/<run>.jsonl`: text, token ids, logprobs, top-k per step; optional activation captures |
-| `sweep/rank.py` | `runs/<run>.units.jsonl`: distinctive words, cluster mass, percentile against controls |
-| `sweep/steer_lens.py` | `stats/steer_lens_L{l}.npz`: next-token Δlogprob and KL for ±0.8 pushes on every neuron |
-| `sweep/depth_report.py` | `runs/depth_report.json`: per-layer share of neurons above controls, coherence, top units |
-| `sweep/shift.py` | word-shift score against controls, all words counted |
-| `sweep/merge_runs.py` | joins sharded runs of one layer |
-| `sweep/check_equivalence.py` | HF vs vLLM steering and capture agreement |
-| `sweep/bench.py`, `sweep/peek.py` | throughput conditions; terminal views of a run |
-| `explorer/build_embeddings.py` | `runs/<run>.umap.json` |
-| `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
-| `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
-| `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
+At startup, activation ranges are measured over a **small local reference text**, with source text and token count saved in the profile. Scores are ratios to this calibration; they are not corpus percentiles or broad claims about a neuron's normal range.
 
-`research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
+## Build token search data
+
+The map and a selected neuron's lenses work without a full index. To enable token search over every neuron:
+
+```bash
+$HOME/venvs/mlx/bin/python3 scripts/build_mlx_lens.py
+# Or: uv run python scripts/build_mlx_lens.py
+```
+
+This is an explicit weight-only indexing job, not a generation sweep. Its output stays under the current model profile. The server discovers the completed index without a restart.
+
+## Focused runtime check
+
+```bash
+$HOME/venvs/mlx/bin/python3 scripts/check_mlx.py
+```
+
+Checks unmodified-versus-instrumented logits, the exact output delta from an additive neuron intervention, zero-dose parity, cleanup of intervention state, activation dimensions, and three independent zero-dose generations. The local report is `work/mlx-check.json` (ignored by Git).
+
+## Remaining upstream features
+
+The CUDA/vLLM sweep scripts, rollout embeddings, weight-sorted layouts and precomputed multi-hop connection indexes have not been ported to MLX. LFM initially has no sweep rollouts or named concepts. The explorer shows direct connections for a selected neuron; token-to-token network overlays require a precomputed connection index. It does not substitute Qwen experiments for missing LFM data.
+
+The original Qwen/PyTorch route remains explicit:
+
+```bash
+EXPLORER_BACKEND=torch uv run --extra qwen python explorer/server.py
+```
+
+See [README.upstream.md](README.upstream.md) and the unchanged upstream research log for the original Qwen experiments. Their neuron identities and findings do not transfer to LFM.
