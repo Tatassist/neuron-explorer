@@ -44,8 +44,13 @@ class TappedMLP(nn.Module):
         self.runtime, self.layer = runtime, layer
 
     def __call__(self, x):
-        h = swiglu(self.w1(x), self.w3(x))
         rt, i = self.runtime, self.layer
+        gate, up = self.w1(x), self.w3(x)
+        h = swiglu(gate, up)
+        if rt._stats is not None and i in rt._stats:
+            rt._stats[i].update(gate, up, h)
+        if rt._capture_inputs is not None and i in rt._capture_inputs:
+            rt._capture_inputs[i] = x[0, -1].astype(mx.float32)
         if rt._capture is not None:
             rt._capture[i] = h[0].astype(mx.float32)
         for layer, n, mode, value in rt._push or []:
@@ -57,7 +62,10 @@ class TappedMLP(nn.Module):
                 h = h.at[..., n].multiply(value)
             else:
                 h = h.at[..., n].add(value)
-        return self.w2(h)
+        out = self.w2(h)
+        if rt._vector_push is not None and rt._vector_push[0] == i:
+            out = out + rt._vector_push[1]
+        return out
 
 
 class TappedHeads(nn.Module):
@@ -87,6 +95,8 @@ class TappedLayer(nn.Module):
         out = self.inner(x, mask, cache)
         if self.runtime._residuals is not None:
             self.runtime._residuals[self.i] = mx.linalg.norm(out[0, 1:].astype(mx.float32), axis=-1)
+        if self.runtime._stats is not None and self.i in self.runtime._stats:
+            self.runtime._stats[self.i].update_resid(out)
         return out
 
 
@@ -99,6 +109,7 @@ class Runtime:
         self.status, self.error = "idle", None
         self.dev = "mlx-metal-gpu"
         self._push = self._heads = self._capture = self._residuals = None
+        self._vector_push = self._capture_inputs = self._stats = None
         self.resid_p50 = {}
         self._lens_cache, self._con_cache = {}, {}
         self._lens_idx = self._steer_idx = self._con_idx = self._vocab = None
@@ -224,6 +235,60 @@ class Runtime:
             finally:
                 self._push = None
         yield None, None
+
+    def sweep_rollout(self, prompt_ids, layer, neuron=None, add=0.0, vector=None,
+                      max_tokens=256, top_k=5, capture_layers=()):
+        """Greedy decoding with a fresh hybrid cache and per-token logprobs.
+
+        Neurons are pushed at the input to w2; random controls at its output.
+        Captures are ffn_norm outputs at the last prompt token, before w1/w3.
+        EOS is retained in token/logprob records and excluded from decoded text.
+        """
+        self.ensure_loaded()
+        self._validate(layer, neuron)
+        if not prompt_ids or not 1 <= max_tokens <= 2048 or not 1 <= top_k <= 100:
+            raise ValueError("Need prompt tokens, max_tokens 1..2048 and top_k 1..100")
+        if not np.isfinite(add) or (vector is not None and neuron is not None):
+            raise ValueError("Use a finite dose and one intervention direction")
+        for target in capture_layers:
+            self._validate(target)
+        if vector is not None:
+            vector = np.asarray(vector, dtype=np.float32)
+            if vector.shape != (ARCH["hidden"],) or not np.isfinite(vector).all():
+                raise ValueError("Random direction must be a finite hidden-size vector")
+        with self.lock:
+            self._push = [(layer, neuron, "add", add)] if neuron is not None else None
+            self._vector_push = (layer, mx.array(vector) * add) if vector is not None else None
+            self._capture_inputs = {i: None for i in capture_layers}
+            cache = self.model.make_cache()
+            generated, chosen, top_ids, top_lps = [], [], [], []
+            finish, captures = "length", {}
+            try:
+                logits = self.model(mx.array([prompt_ids]), cache=cache)[0, -1].astype(mx.float32)
+                mx.eval(logits, *self._capture_inputs.values())
+                captures = {i: cpu(x).astype(np.float16) for i, x in self._capture_inputs.items()}
+                self._capture_inputs = None
+                for step in range(max_tokens):
+                    lp = logits - mx.logsumexp(logits)
+                    indices = mx.argpartition(-lp, kth=top_k - 1)[:top_k]
+                    indices = indices[mx.argsort(-lp[indices])]
+                    token = mx.argmax(logits)
+                    mx.eval(token, indices, lp)
+                    tid = int(token.item())
+                    generated.append(tid)
+                    chosen.append(float(lp[tid].item()))
+                    top_ids.append(indices.tolist())
+                    top_lps.append(cpu(lp[indices]).tolist())
+                    if tid in self.tok.eos_token_ids:
+                        finish = "stop"
+                        break
+                    if step + 1 < max_tokens:
+                        logits = self.model(mx.array([[tid]]), cache=cache)[0, -1].astype(mx.float32)
+                text_ids = generated[:-1] if finish == "stop" else generated
+                return {"text": self.tok.decode(text_ids), "finish": finish, "n_gen": len(generated),
+                        "token_ids": generated, "logprob": chosen, "top_ids": top_ids, "top_lps": top_lps}, captures
+            finally:
+                self._push = self._vector_push = self._capture_inputs = None
 
     def _forward(self, ids, pushes=None, heads=None, capture=False):
         self.ensure_loaded()

@@ -1,11 +1,11 @@
 [project]
 name = "neuron-explorer"
 version = "0.2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "mlx==0.31.1",
     "mlx-lm==0.31.1",
-    "numpy",
+    "numpy>=2.3.3",
     "fastapi>=0.137.0",
     "uvicorn>=0.49.0",
 ]
@@ -19,6 +19,6 @@ qwen = [
     "accelerate",
 ]
 analysis = [
-    "sentence-transformers>=6.1.0",
     "umap-learn>=0.5.12",
 ]
+qwen-analysis = ["sentence-transformers>=6.1.0", "umap-learn>=0.5.12"]

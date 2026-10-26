@@ -7,6 +7,8 @@ export TRANSFORMERS_OFFLINE=1
 export UV_CACHE_DIR="$EXPLORER_ROOT/.cache/uv"
 if [[ -n "${EXPLORER_PYTHON:-}" ]]; then
     exec "$EXPLORER_PYTHON" "$EXPLORER_ROOT/explorer/server.py"
+elif [[ -x "$EXPLORER_ROOT/.venv/bin/python" ]]; then
+    exec "$EXPLORER_ROOT/.venv/bin/python" "$EXPLORER_ROOT/explorer/server.py"
 elif [[ -x "$HOME/venvs/mlx/bin/python3" ]]; then
     exec "$HOME/venvs/mlx/bin/python3" "$EXPLORER_ROOT/explorer/server.py"
 else

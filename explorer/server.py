@@ -65,6 +65,8 @@ def layer_runs():
     best = {}
     for meta_path in glob.glob(os.path.join(RUNS, "*.meta.json")):
         meta = json.load(open(meta_path))
+        if BACKEND == "mlx" and meta.get("profile") != PROFILE:
+            continue
         if meta.get("design_name", "main") == "calib":
             continue
         jsonl = meta_path.replace(".meta.json", ".jsonl")
@@ -199,7 +201,17 @@ def embeddings(layer: int):
     if d is None:
         return {}
     path = d["path"].replace(".jsonl", ".umap.json")
-    return FileResponse(path) if os.path.exists(path) else JSONResponse({})
+    if not os.path.exists(path):
+        return {}
+    if BACKEND == "mlx":
+        with open(path) as f:
+            data = json.load(f)
+        source = os.stat(d["path"])
+        if (data.get("profile") != PROFILE or data.get("source_size") != source.st_size
+                or data.get("source_mtime_ns") != source.st_mtime_ns):
+            return {"stale": True, "message": "Sweep changed; rebuild its embeddings"}
+        return data
+    return FileResponse(path)
 
 
 @app.get("/api/rollout")
@@ -481,7 +493,12 @@ def layout(kind: str = "writes"):
     path = os.path.join(CACHE, f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
-    cell = np.load(path)["cell"].astype(np.int16)
+    with np.load(path, allow_pickle=False) as data:
+        if BACKEND == "mlx" and ("profile" not in data or str(data["profile"]) != PROFILE):
+            return {"available": False}
+        cell = data["cell"].astype(np.int16)
+    if cell.shape != (ARCH["n_layers"], ARCH["inter"]):
+        return {"available": False}
     return {"available": True, "shape": list(cell.shape), "cell": base64.b64encode(cell.tobytes()).decode()}
 
 

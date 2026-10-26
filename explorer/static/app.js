@@ -182,7 +182,7 @@ async function loadEmbeddings() {
   $("#embed-empty").textContent = "…";
   const d = index.layers[l] ? await api(`/api/embeddings?layer=${l}`) : {};
   if (state.layer !== l) return;
-  $("#embed-empty").textContent = d.x ? "" : "—";
+  $("#embed-empty").textContent = d.x ? "" : d.message || "—";
   scatter.setData(d.x ? { ...d, layer: l } : null);
   scatter.select(state.layer, state.focus?.layer === state.layer ? state.focus.n : null);
 }
@@ -494,7 +494,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
   if (!isFocus(layer, n, kind)) return;
   setNameField(u.name || "");
-  if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
+  if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${u.stats.null_pct == null ? "—" : (u.stats.null_pct * 100).toFixed(0) + "%"}`;
   renderExamples(u);
   renderDetails(u);
   const hasRollouts = !!(u.rollouts && u.rollouts.length);

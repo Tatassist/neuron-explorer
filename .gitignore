@@ -1,4 +1,5 @@
 .venv/
+.venv-py310/
 data/
 work/
 .cache/
